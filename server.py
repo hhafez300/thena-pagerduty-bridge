@@ -236,10 +236,10 @@ async def thena_events(req: Request):
       - Accepts validator pings (empty / non-JSON) and returns 200
 
       - For ticket:created:
-          * If there is NO assignee -> do nothing (wait for update)
+          * If there is NO assignee -> do nothing (wait for assignment event)
           * If there is a mapped assignee -> trigger PD (once)
 
-      - For ticket:updated:
+      - For ticket:updated or ticket:assigned:
           * If ticket was already triggered -> do nothing
           * If there is NO assignee -> do nothing
           * If there is a mapped assignee AND we never triggered before -> trigger PD (once)
@@ -271,10 +271,10 @@ async def thena_events(req: Request):
     )
     logger.debug("Full Thena payload: %s", body)
 
-    # Only act on ticket:created / ticket:updated
-    if event_type not in ("ticket:created", "ticket:updated"):
+    # Only act on ticket:created / ticket:updated / ticket:assigned
+    if event_type not in ("ticket:created", "ticket:updated", "ticket:assigned"):
         logger.info(
-            "Ignoring eventType=%s for ticketId=%s (not ticket:created/updated)",
+            "Ignoring eventType=%s for ticketId=%s (not ticket:created/updated/assigned)",
             event_type,
             ticket_id,
         )
@@ -310,7 +310,7 @@ async def thena_events(req: Request):
         # Creation: only trigger if there is a mapped assignee
         if not assignee_identifier:
             logger.info(
-                "ticketId=%s created with NO assignee -> waiting for update",
+                "ticketId=%s created with NO assignee -> waiting for assignment",
                 ticket_id,
             )
             return {
@@ -320,22 +320,24 @@ async def thena_events(req: Request):
                 "ticketId": ticket_id,
             }
 
-    elif event_type == "ticket:updated":
-        # Update: only trigger if there is a mapped assignee
+    elif event_type in ("ticket:updated", "ticket:assigned"):
+        # Update/assignment: only trigger if there is a mapped assignee
         if not assignee_identifier:
             logger.info(
-                "ticketId=%s updated but still NO assignee -> ignoring",
+                "ticketId=%s %s but still NO assignee -> ignoring",
                 ticket_id,
+                event_type,
             )
             return {
                 "ok": True,
                 "ignored": True,
                 "reason": "no_assignee_on_update",
                 "ticketId": ticket_id,
+                "eventType": event_type,
             }
 
     # At this point:
-    # - event_type is either ticket:created or ticket:updated
+    # - event_type is ticket:created, ticket:updated, or ticket:assigned
     # - assignee_identifier is non-null
 
     # Map assignee -> group (A/B/...)
