@@ -32,12 +32,25 @@ WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN", "")
 
 # Map each assignee -> service group A or B
 ASSIGNEE_TO_SERVICE_GROUP: Dict[str, str] = {
-    "hossamhafez@luciq.ai": "A",
+    # Team A
     "mahmoudelfiqi@luciq.ai": "A",
+    "UMM2LEELBR": "A",      # Fiqi
+
     "ibrahimsalem@luciq.ai": "A",
-    "bedourelborai@luciq.ai": "B",
-    "omarabdelsattar@luciq.ai": "B",
+    "UXX91JJ92J": "A",      # Ibrahim
+
+    "hossamhafez@luciq.ai": "A",
+    "UAA43NN1Z1": "A",      # Hossam
+
+    # Team B
     "mirettewagdy@luciq.ai": "B",
+    "U55BD44N8J": "B",      # Mirette
+
+    "omarabdelsattar@luciq.ai": "B",
+    "UEEB866ZDO": "B",      # Omar
+
+    "bedourelborai@luciq.ai": "B",
+    "UPPEJ11K3H": "B",      # Bedour
 }
 
 SERVICE_GROUP_TO_ROUTING_KEY: Dict[str, str] = {
