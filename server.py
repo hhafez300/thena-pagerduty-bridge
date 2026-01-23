@@ -1,5 +1,7 @@
 import os
 import logging
+import sqlite3
+import threading
 from typing import Any, Dict, Optional
 
 import httpx
@@ -9,8 +11,10 @@ from dotenv import load_dotenv
 # -------------------------------------------------------------------
 # Logging setup
 # -------------------------------------------------------------------
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+
 logging.basicConfig(
-    level=logging.INFO,
+    level=LOG_LEVEL,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("thena-pagerduty-bridge")
@@ -19,6 +23,9 @@ load_dotenv()
 
 app = FastAPI()
 
+# -------------------------------------------------------------------
+# Config
+# -------------------------------------------------------------------
 PD_EVENTS_URL = os.getenv(
     "PD_EVENTS_URL",
     "https://events.pagerduty.com/v2/enqueue"
@@ -29,6 +36,9 @@ PD_ROUTING_KEY_A = os.getenv("PD_ROUTING_KEY_A", "")
 PD_ROUTING_KEY_B = os.getenv("PD_ROUTING_KEY_B", "")
 
 WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN", "")
+
+# Persistent state DB (to avoid duplicates across restarts / scale-to-zero)
+STATE_DB_PATH = os.getenv("STATE_DB_PATH", "./state.db")
 
 # Map each assignee -> service group A or B
 ASSIGNEE_TO_SERVICE_GROUP: Dict[str, str] = {
@@ -58,9 +68,76 @@ SERVICE_GROUP_TO_ROUTING_KEY: Dict[str, str] = {
     "B": PD_ROUTING_KEY_B,
 }
 
-# Optional simple idempotency by ticket
-TICKETS_TRIGGERED: set[str] = set()
+# -------------------------------------------------------------------
+# Persistent state store (SQLite)
+# -------------------------------------------------------------------
+_db_lock = threading.Lock()
 
+
+def _db_connect() -> sqlite3.Connection:
+    # check_same_thread=False allows usage across async requests; we also protect with a lock.
+    conn = sqlite3.connect(STATE_DB_PATH, check_same_thread=False)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    return conn
+
+
+def init_state_db():
+    try:
+        with _db_lock:
+            conn = _db_connect()
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS triggered_tickets (
+                    ticket_id TEXT PRIMARY KEY,
+                    triggered_at TEXT DEFAULT (datetime('now'))
+                )
+                """
+            )
+            conn.commit()
+            conn.close()
+        logger.info("State DB initialized at path=%s", STATE_DB_PATH)
+    except Exception as e:
+        # If DB fails for any reason, we should log loudly because duplication protection might break.
+        logger.exception("Failed to initialize state DB at %s: %s", STATE_DB_PATH, e)
+
+
+def is_ticket_triggered(ticket_id: str) -> bool:
+    try:
+        with _db_lock:
+            conn = _db_connect()
+            cur = conn.execute(
+                "SELECT 1 FROM triggered_tickets WHERE ticket_id = ? LIMIT 1",
+                (ticket_id,),
+            )
+            row = cur.fetchone()
+            conn.close()
+            return row is not None
+    except Exception as e:
+        logger.exception("State DB read failed for ticket_id=%s: %s", ticket_id, e)
+        # Fail-safe choice:
+        # If DB read fails, assume NOT triggered so we don't lose alerting.
+        # This might allow duplicates if DB is broken.
+        return False
+
+
+def mark_ticket_triggered(ticket_id: str) -> None:
+    try:
+        with _db_lock:
+            conn = _db_connect()
+            conn.execute(
+                "INSERT OR IGNORE INTO triggered_tickets(ticket_id) VALUES (?)",
+                (ticket_id,),
+            )
+            conn.commit()
+            conn.close()
+    except Exception as e:
+        logger.exception("State DB write failed for ticket_id=%s: %s", ticket_id, e)
+        # Fail-safe: if write fails, we might get duplicates later, but we do not block the current request.
+
+
+# Initialize DB at import time (works for Render)
+init_state_db()
 
 # -------------------------------------------------------------------
 # Helpers
@@ -169,6 +246,7 @@ async def trigger_pd_for_ticket(
     priority = ticket.get("priorityName") or ticket.get("priority")
     severity = map_severity(priority)
 
+    # Important: dedup_key keeps PD deduping the same ticket into one incident.
     dedup_key = f"thena-ticket-{ticket_id}"
 
     pd_event = {
@@ -244,20 +322,20 @@ def thena_events_probe(req: Request):
 @app.post("/thena/events")
 async def thena_events(req: Request):
     """
-    Main Thena webhook (SMART BEHAVIOR):
+    Policy A behavior (clean, low-noise):
 
       - Accepts validator pings (empty / non-JSON) and returns 200
 
-      - For ticket:created:
-          * If there is NO assignee -> do nothing (wait for assignment event)
-          * If there is a mapped assignee -> trigger PD (once)
+      - Trigger PagerDuty ONLY for new-ticket paging semantics:
+          1) ticket:created
+              - If NO assignee -> do nothing (wait)
+              - If assignee is mapped -> trigger PD (once)
 
-      - For ticket:updated or ticket:assigned:
-          * If ticket was already triggered -> do nothing
-          * If there is NO assignee -> do nothing
-          * If there is a mapped assignee AND we never triggered before -> trigger PD (once)
+          2) ticket:assigned (can happen later, even hours later)
+              - If already triggered -> do nothing
+              - If assignee is mapped -> trigger PD (once)
 
-      - Other event types are ignored but return 200
+      - NEVER trigger on ticket:updated or any other event types.
     """
     require_token(req)
     body = await safe_json(req)
@@ -284,19 +362,19 @@ async def thena_events(req: Request):
     )
     logger.debug("Full Thena payload: %s", body)
 
-    # Only act on ticket:created / ticket:updated / ticket:assigned
-    if event_type not in ("ticket:created", "ticket:updated", "ticket:assigned"):
+    # Only act on ticket:created / ticket:assigned
+    if event_type not in ("ticket:created", "ticket:assigned"):
         logger.info(
-            "Ignoring eventType=%s for ticketId=%s (not ticket:created/updated/assigned)",
+            "Ignoring eventType=%s for ticketId=%s (not ticket:created/assigned)",
             event_type,
             ticket_id,
         )
         return {"ok": True, "ignored": True, "eventType": event_type}
 
-    # If we already fired PD for this ticket, never do it again
-    if ticket_id in TICKETS_TRIGGERED:
+    # Persistent idempotency: if we already fired PD for this ticket, never do it again
+    if is_ticket_triggered(ticket_id):
         logger.info(
-            "Ticket %s already triggered PagerDuty before, ignoring eventType=%s",
+            "Ticket %s already triggered PagerDuty before (persisted), ignoring eventType=%s",
             ticket_id,
             event_type,
         )
@@ -317,43 +395,44 @@ async def thena_events(req: Request):
         assignee_identifier,
     )
 
-    # ---------- SMART BEHAVIOR ----------
+    # If created but unassigned -> do nothing and wait for ticket:assigned later
+    if event_type == "ticket:created" and not assignee_identifier:
+        logger.info(
+            "ticketId=%s created with NO assignee -> waiting for ticket:assigned",
+            ticket_id,
+        )
+        return {
+            "ok": True,
+            "ignored": True,
+            "reason": "no_assignee_on_create",
+            "ticketId": ticket_id,
+        }
 
-    if event_type == "ticket:created":
-        # Creation: only trigger if there is a mapped assignee
-        if not assignee_identifier:
-            logger.info(
-                "ticketId=%s created with NO assignee -> waiting for assignment",
-                ticket_id,
-            )
-            return {
-                "ok": True,
-                "ignored": True,
-                "reason": "no_assignee_on_create",
-                "ticketId": ticket_id,
-            }
+    # If assigned event but still missing assignee -> ignore
+    if event_type == "ticket:assigned" and not assignee_identifier:
+        logger.info(
+            "ticketId=%s assigned event but assignee is missing -> ignoring",
+            ticket_id,
+        )
+        return {
+            "ok": True,
+            "ignored": True,
+            "reason": "no_assignee_on_assigned",
+            "ticketId": ticket_id,
+            "eventType": event_type,
+        }
 
-    elif event_type in ("ticket:updated", "ticket:assigned"):
-        # Update/assignment: only trigger if there is a mapped assignee
-        if not assignee_identifier:
-            logger.info(
-                "ticketId=%s %s but still NO assignee -> ignoring",
-                ticket_id,
-                event_type,
-            )
-            return {
-                "ok": True,
-                "ignored": True,
-                "reason": "no_assignee_on_update",
-                "ticketId": ticket_id,
-                "eventType": event_type,
-            }
+    # Defensive check
+    if not assignee_identifier:
+        return {
+            "ok": True,
+            "ignored": True,
+            "reason": "assignee_missing_defensive",
+            "ticketId": ticket_id,
+            "eventType": event_type,
+        }
 
-    # At this point:
-    # - event_type is ticket:created, ticket:updated, or ticket:assigned
-    # - assignee_identifier is non-null
-
-    # Map assignee -> group (A/B/...)
+    # Map assignee -> group (A/B)
     group = ASSIGNEE_TO_SERVICE_GROUP.get(assignee_identifier)
     if not group:
         logger.info(
@@ -384,14 +463,13 @@ async def thena_events(req: Request):
         )
 
     logger.info(
-        "ticketId=%s eventType=%s assignee=%s mapped to serviceGroup=%s",
+        "ticketId=%s eventType=%s assignee=%s mapped to serviceGroup=%s -> triggering PD",
         ticket_id,
         event_type,
         assignee_identifier,
         group,
     )
 
-    # Trigger PD
     pd_response = await trigger_pd_for_ticket(
         routing_key=routing_key,
         ticket=ticket,
@@ -399,10 +477,10 @@ async def thena_events(req: Request):
         event_type=event_type,
     )
 
-    # Mark ticket as triggered so we never open multiple incidents
-    TICKETS_TRIGGERED.add(ticket_id)
+    # Mark ticket as triggered (persisted), so we never open multiple incidents even after restart
+    mark_ticket_triggered(ticket_id)
     logger.info(
-        "ticketId=%s added to TICKETS_TRIGGERED set after PagerDuty trigger",
+        "ticketId=%s marked as triggered in state DB",
         ticket_id,
     )
 
