@@ -26,18 +26,14 @@ app = FastAPI()
 # -------------------------------------------------------------------
 # Config
 # -------------------------------------------------------------------
-PD_EVENTS_URL = os.getenv(
-    "PD_EVENTS_URL",
-    "https://events.pagerduty.com/v2/enqueue"
-)
+PD_EVENTS_URL = os.getenv("PD_EVENTS_URL", "https://events.pagerduty.com/v2/enqueue")
 
-# Two PagerDuty services
 PD_ROUTING_KEY_A = os.getenv("PD_ROUTING_KEY_A", "")
 PD_ROUTING_KEY_B = os.getenv("PD_ROUTING_KEY_B", "")
 
 WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN", "")
 
-# Persistent state DB (to avoid duplicates across restarts / scale-to-zero)
+# Persistent state DB (avoid duplicates across concurrent deliveries/restarts)
 STATE_DB_PATH = os.getenv("STATE_DB_PATH", "./state.db")
 
 # Map each assignee -> service group A or B
@@ -69,13 +65,12 @@ SERVICE_GROUP_TO_ROUTING_KEY: Dict[str, str] = {
 }
 
 # -------------------------------------------------------------------
-# Persistent state store (SQLite)
+# Persistent state store (SQLite) with atomic "claim"
 # -------------------------------------------------------------------
 _db_lock = threading.Lock()
 
 
 def _db_connect() -> sqlite3.Connection:
-    # check_same_thread=False allows usage across async requests; we also protect with a lock.
     conn = sqlite3.connect(STATE_DB_PATH, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
@@ -88,9 +83,11 @@ def init_state_db():
             conn = _db_connect()
             conn.execute(
                 """
-                CREATE TABLE IF NOT EXISTS triggered_tickets (
+                CREATE TABLE IF NOT EXISTS ticket_state (
                     ticket_id TEXT PRIMARY KEY,
-                    triggered_at TEXT DEFAULT (datetime('now'))
+                    state TEXT NOT NULL,                 -- processing | triggered
+                    created_at TEXT DEFAULT (datetime('now')),
+                    updated_at TEXT DEFAULT (datetime('now'))
                 )
                 """
             )
@@ -98,27 +95,54 @@ def init_state_db():
             conn.close()
         logger.info("State DB initialized at path=%s", STATE_DB_PATH)
     except Exception as e:
-        # If DB fails for any reason, we should log loudly because duplication protection might break.
         logger.exception("Failed to initialize state DB at %s: %s", STATE_DB_PATH, e)
 
 
 def is_ticket_triggered(ticket_id: str) -> bool:
+    """
+    True only if state is 'triggered'. If it's 'processing', we also treat it as already handled
+    to prevent duplicates during concurrent delivery.
+    """
     try:
         with _db_lock:
             conn = _db_connect()
             cur = conn.execute(
-                "SELECT 1 FROM triggered_tickets WHERE ticket_id = ? LIMIT 1",
+                "SELECT state FROM ticket_state WHERE ticket_id = ? LIMIT 1",
                 (ticket_id,),
             )
             row = cur.fetchone()
             conn.close()
-            return row is not None
+            if not row:
+                return False
+            # processing or triggered means "do not trigger again"
+            return row[0] in ("processing", "triggered")
     except Exception as e:
         logger.exception("State DB read failed for ticket_id=%s: %s", ticket_id, e)
-        # Fail-safe choice:
-        # If DB read fails, assume NOT triggered so we don't lose alerting.
-        # This might allow duplicates if DB is broken.
+        # Fail-safe: allow triggering if DB is broken (might duplicate)
         return False
+
+
+def claim_ticket_for_trigger(ticket_id: str) -> bool:
+    """
+    Atomic claim:
+      - Insert ticket_id with state='processing'
+      - If already exists, claim fails (someone else already triggered or is triggering)
+    """
+    try:
+        with _db_lock:
+            conn = _db_connect()
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO ticket_state(ticket_id, state) VALUES (?, 'processing')",
+                (ticket_id,),
+            )
+            conn.commit()
+            claimed = cur.rowcount == 1
+            conn.close()
+            return claimed
+    except Exception as e:
+        logger.exception("State DB claim failed for ticket_id=%s: %s", ticket_id, e)
+        # Fail-safe: do not block triggering if DB is broken
+        return True
 
 
 def mark_ticket_triggered(ticket_id: str) -> None:
@@ -126,17 +150,29 @@ def mark_ticket_triggered(ticket_id: str) -> None:
         with _db_lock:
             conn = _db_connect()
             conn.execute(
-                "INSERT OR IGNORE INTO triggered_tickets(ticket_id) VALUES (?)",
+                "UPDATE ticket_state SET state='triggered', updated_at=datetime('now') WHERE ticket_id=?",
                 (ticket_id,),
             )
             conn.commit()
             conn.close()
     except Exception as e:
-        logger.exception("State DB write failed for ticket_id=%s: %s", ticket_id, e)
-        # Fail-safe: if write fails, we might get duplicates later, but we do not block the current request.
+        logger.exception("State DB mark triggered failed for ticket_id=%s: %s", ticket_id, e)
 
 
-# Initialize DB at import time (works for Render)
+def release_ticket_claim(ticket_id: str) -> None:
+    """
+    If triggering PagerDuty failed, remove the 'processing' state so a later event can retry.
+    """
+    try:
+        with _db_lock:
+            conn = _db_connect()
+            conn.execute("DELETE FROM ticket_state WHERE ticket_id=?", (ticket_id,))
+            conn.commit()
+            conn.close()
+    except Exception as e:
+        logger.exception("State DB release claim failed for ticket_id=%s: %s", ticket_id, e)
+
+
 init_state_db()
 
 # -------------------------------------------------------------------
@@ -150,10 +186,6 @@ def require_token(req: Request):
 
 
 async def safe_json(req: Request) -> dict:
-    """
-    Thena (or its validator) may send GET/HEAD, or POST with empty/non-JSON body.
-    This prevents 400/500 during validation.
-    """
     try:
         body = await req.json()
         logger.debug("Parsed JSON body: %s", body)
@@ -164,7 +196,6 @@ async def safe_json(req: Request) -> dict:
 
 
 def map_severity(priority: str | None) -> str:
-    # PagerDuty allowed severities: critical|error|warning|info
     p = (priority or "").strip().lower()
     if p in ("p0", "sev0", "urgent", "critical", "high"):
         return "critical"
@@ -176,27 +207,16 @@ def map_severity(priority: str | None) -> str:
 
 
 def extract_assigned_to(ticket: Dict[str, Any]) -> Optional[str]:
-    """
-    Extract primary assignee from ticket["assignedTo"].
-
-    Handles:
-      - null
-      - string
-      - dict with email/id
-      - list of strings or dicts
-    """
     assigned_to = ticket.get("assignedTo")
     logger.debug("Raw assignedTo field: %r", assigned_to)
 
     if assigned_to is None:
         return None
 
-    # Simple string (email / id)
     if isinstance(assigned_to, str):
         v = assigned_to.strip()
         return v or None
 
-    # Single object
     if isinstance(assigned_to, dict):
         email = assigned_to.get("email") or assigned_to.get("userEmail")
         if isinstance(email, str) and email.strip():
@@ -208,7 +228,6 @@ def extract_assigned_to(ticket: Dict[str, Any]) -> Optional[str]:
 
         return None
 
-    # List (we take the first)
     if isinstance(assigned_to, list) and assigned_to:
         first = assigned_to[0]
 
@@ -234,9 +253,6 @@ async def trigger_pd_for_ticket(
     assignee_identifier: str,
     event_type: str,
 ) -> dict:
-    """
-    Build and send PagerDuty event for a given ticket + assignee.
-    """
     if not routing_key:
         logger.error("Missing PagerDuty routing key when trying to trigger PD")
         raise HTTPException(status_code=500, detail="Missing PagerDuty routing key")
@@ -246,7 +262,6 @@ async def trigger_pd_for_ticket(
     priority = ticket.get("priorityName") or ticket.get("priority")
     severity = map_severity(priority)
 
-    # Important: dedup_key keeps PD deduping the same ticket into one incident.
     dedup_key = f"thena-ticket-{ticket_id}"
 
     pd_event = {
@@ -305,12 +320,9 @@ async def trigger_pd_for_ticket(
 # -------------------------------------------------------------------
 @app.get("/health")
 def health():
-    logger.debug("Health check called")
     return {"ok": True}
 
 
-# ---- Thena events endpoint ----
-# Keep GET/HEAD so Thena validation never fails
 @app.get("/thena/events")
 @app.head("/thena/events")
 def thena_events_probe(req: Request):
@@ -322,20 +334,14 @@ def thena_events_probe(req: Request):
 @app.post("/thena/events")
 async def thena_events(req: Request):
     """
-    Policy A behavior (clean, low-noise):
-
-      - Accepts validator pings (empty / non-JSON) and returns 200
-
-      - Trigger PagerDuty ONLY for new-ticket paging semantics:
-          1) ticket:created
-              - If NO assignee -> do nothing (wait)
-              - If assignee is mapped -> trigger PD (once)
-
-          2) ticket:assigned (can happen later, even hours later)
-              - If already triggered -> do nothing
-              - If assignee is mapped -> trigger PD (once)
-
-      - NEVER trigger on ticket:updated or any other event types.
+    Policy A (noise-free):
+      - Only handle ticket:created and ticket:assigned
+      - Trigger once per ticket:
+          * created + assignee -> trigger
+          * created no assignee -> wait
+          * assigned later (even hours later) -> trigger once
+      - Ignore ticket:updated and all other event types
+      - Prevent re-trigger on reassignment using atomic DB claim
     """
     require_token(req)
     body = await safe_json(req)
@@ -371,22 +377,22 @@ async def thena_events(req: Request):
         )
         return {"ok": True, "ignored": True, "eventType": event_type}
 
-    # Persistent idempotency: if we already fired PD for this ticket, never do it again
+    # If already triggered (or currently processing) -> ignore
     if is_ticket_triggered(ticket_id):
         logger.info(
-            "Ticket %s already triggered PagerDuty before (persisted), ignoring eventType=%s",
+            "Ticket %s already triggered/processing (persisted), ignoring eventType=%s",
             ticket_id,
             event_type,
         )
         return {
             "ok": True,
             "ignored": True,
-            "reason": "ticket_already_triggered",
+            "reason": "ticket_already_triggered_or_processing",
             "ticketId": ticket_id,
             "eventType": event_type,
         }
 
-    # Extract assignee (email or user id) from ticket.assignedTo
+    # Extract assignee
     assignee_identifier = extract_assigned_to(ticket)
     logger.info(
         "ticketId=%s eventType=%s extracted assignee=%r",
@@ -395,7 +401,7 @@ async def thena_events(req: Request):
         assignee_identifier,
     )
 
-    # If created but unassigned -> do nothing and wait for ticket:assigned later
+    # created but unassigned -> do nothing and wait for ticket:assigned later
     if event_type == "ticket:created" and not assignee_identifier:
         logger.info(
             "ticketId=%s created with NO assignee -> waiting for ticket:assigned",
@@ -408,10 +414,10 @@ async def thena_events(req: Request):
             "ticketId": ticket_id,
         }
 
-    # If assigned event but still missing assignee -> ignore
+    # assigned event but missing assignee -> ignore
     if event_type == "ticket:assigned" and not assignee_identifier:
         logger.info(
-            "ticketId=%s assigned event but assignee is missing -> ignoring",
+            "ticketId=%s assigned event but assignee missing -> ignoring",
             ticket_id,
         )
         return {
@@ -422,7 +428,7 @@ async def thena_events(req: Request):
             "eventType": event_type,
         }
 
-    # Defensive check
+    # Must have an assignee here
     if not assignee_identifier:
         return {
             "ok": True,
@@ -432,7 +438,7 @@ async def thena_events(req: Request):
             "eventType": event_type,
         }
 
-    # Map assignee -> group (A/B)
+    # Map assignee -> group
     group = ASSIGNEE_TO_SERVICE_GROUP.get(assignee_identifier)
     if not group:
         logger.info(
@@ -457,10 +463,22 @@ async def thena_events(req: Request):
             assignee_identifier,
             group,
         )
-        raise HTTPException(
-            status_code=500,
-            detail=f"No routing key configured for group {group}",
+        raise HTTPException(status_code=500, detail=f"No routing key configured for group {group}")
+
+    # Atomic claim BEFORE triggering PD to prevent duplicate triggers on reassignment/concurrency
+    claimed = claim_ticket_for_trigger(ticket_id)
+    if not claimed:
+        logger.info(
+            "ticketId=%s could not be claimed (already processing/triggered) -> ignoring",
+            ticket_id,
         )
+        return {
+            "ok": True,
+            "ignored": True,
+            "reason": "ticket_already_claimed",
+            "ticketId": ticket_id,
+            "eventType": event_type,
+        }
 
     logger.info(
         "ticketId=%s eventType=%s assignee=%s mapped to serviceGroup=%s -> triggering PD",
@@ -470,32 +488,32 @@ async def thena_events(req: Request):
         group,
     )
 
-    pd_response = await trigger_pd_for_ticket(
-        routing_key=routing_key,
-        ticket=ticket,
-        assignee_identifier=assignee_identifier,
-        event_type=event_type,
-    )
+    try:
+        pd_response = await trigger_pd_for_ticket(
+            routing_key=routing_key,
+            ticket=ticket,
+            assignee_identifier=assignee_identifier,
+            event_type=event_type,
+        )
+        mark_ticket_triggered(ticket_id)
+        logger.info("ticketId=%s marked as triggered in state DB", ticket_id)
 
-    # Mark ticket as triggered (persisted), so we never open multiple incidents even after restart
-    mark_ticket_triggered(ticket_id)
-    logger.info(
-        "ticketId=%s marked as triggered in state DB",
-        ticket_id,
-    )
+        return {
+            "ok": True,
+            "pagerduty": pd_response,
+            "ticketId": ticket_id,
+            "assignee": assignee_identifier,
+            "serviceGroup": group,
+            "eventType": event_type,
+        }
 
-    return {
-        "ok": True,
-        "pagerduty": pd_response,
-        "ticketId": ticket_id,
-        "assignee": assignee_identifier,
-        "serviceGroup": group,
-        "eventType": event_type,
-    }
+    except Exception as e:
+        # If PD trigger failed, release the claim so future events can retry.
+        release_ticket_claim(ticket_id)
+        logger.exception("ticketId=%s trigger failed; released claim. Error=%s", ticket_id, e)
+        raise
 
 
-# ---- Thena installations endpoint ----
-# Keep GET/HEAD/POST for validation
 @app.get("/thena/installations")
 @app.head("/thena/installations")
 def thena_installations_probe(req: Request):
