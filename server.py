@@ -20,7 +20,6 @@ logging.basicConfig(
 logger = logging.getLogger("thena-pagerduty-bridge")
 
 load_dotenv()
-
 app = FastAPI()
 
 # -------------------------------------------------------------------
@@ -28,49 +27,37 @@ app = FastAPI()
 # -------------------------------------------------------------------
 PD_EVENTS_URL = os.getenv("PD_EVENTS_URL", "https://events.pagerduty.com/v2/enqueue")
 
-# Two PagerDuty services
-PD_ROUTING_KEY_A = os.getenv("PD_ROUTING_KEY_A", "")
-PD_ROUTING_KEY_B = os.getenv("PD_ROUTING_KEY_B", "")
+# Single PagerDuty service routing key (ONLY ONE SERVICE NOW)
+PD_ROUTING_KEY = os.getenv("PD_ROUTING_KEY", "").strip()
 
-WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN", "")
+WEBHOOK_TOKEN = os.getenv("WEBHOOK_TOKEN", "").strip()
 
 # Persistent state DB (avoid duplicates across restarts/concurrency)
 STATE_DB_PATH = os.getenv("STATE_DB_PATH", "./state.db")
 
-# Default group for unassigned tickets (triage)
-# Set this to "A" or "B" depending on who should receive unassigned new tickets.
-DEFAULT_SERVICE_GROUP = os.getenv("DEFAULT_SERVICE_GROUP", "A").strip().upper()
-
-# Map each assignee -> service group A or B
-ASSIGNEE_TO_SERVICE_GROUP: Dict[str, str] = {
-    # Team A
-    "mahmoudelfiqi@luciq.ai": "A",
-    "UMM2LEELBR": "A",      # Fiqi
-
-    "ibrahimsalem@luciq.ai": "A",
-    "UXX91JJ92J": "A",      # Ibrahim
-
-    "hossamhafez@luciq.ai": "A",
-    "UAA43NN1Z1": "A",      # Hossam
-
-    # Team B
-    "mirettewagdy@luciq.ai": "B",
-    "U55BD44N8J": "B",      # Mirette
-
-    "omarabdelsattar@luciq.ai": "B",
-    "UEEB866ZDO": "B",      # Omar
-
-    "bedourelborai@luciq.ai": "B",
-    "UPPEJ11K3H": "B",      # Bedour
+# Team members (4 only). Used for optional allowlist behavior on assigned tickets.
+# Keep both email + Thena user ID because Thena may send either.
+TEAM_MEMBERS: set[str] = {
+    # Mahmoud
+    "mahmoudelfiqi@luciq.ai",
+    "UMM2LEELBR",
+    # Ibrahim
+    "ibrahimsalem@luciq.ai",
+    "UXX91JJ92J",
+    # Hossam
+    "hossamhafez@luciq.ai",
+    "UAA43NN1Z1",
+    # Omar
+    "omarabdelsattar@luciq.ai",
+    "UEEB866ZDO",
 }
 
-SERVICE_GROUP_TO_ROUTING_KEY: Dict[str, str] = {
-    "A": PD_ROUTING_KEY_A,
-    "B": PD_ROUTING_KEY_B,
-}
+# If true: only trigger on ticket:assigned when assignee is one of TEAM_MEMBERS.
+# If false: any assignee triggers (still routed to the single PD service).
+REQUIRE_ASSIGNEE_IN_TEAM = os.getenv("REQUIRE_ASSIGNEE_IN_TEAM", "true").lower() == "true"
 
 # -------------------------------------------------------------------
-# Persistent state store (SQLite) with atomic "claim"
+# Persistent state store (SQLite) with atomic claim
 # -------------------------------------------------------------------
 _db_lock = threading.Lock()
 
@@ -105,7 +92,7 @@ def init_state_db():
 
 def is_ticket_handled(ticket_id: str) -> bool:
     """
-    If state is 'processing' or 'triggered', we treat it as handled to prevent duplicates.
+    If state is 'processing' or 'triggered', treat it as handled to prevent duplicates.
     """
     try:
         with _db_lock:
@@ -197,6 +184,7 @@ async def safe_json(req: Request) -> dict:
 
 
 def map_severity(priority: str | None) -> str:
+    # PagerDuty severities: critical|error|warning|info
     p = (priority or "").strip().lower()
     if p in ("p0", "sev0", "urgent", "critical", "high"):
         return "critical"
@@ -208,6 +196,15 @@ def map_severity(priority: str | None) -> str:
 
 
 def extract_assigned_to(ticket: Dict[str, Any]) -> Optional[str]:
+    """
+    Extract primary assignee from ticket["assignedTo"].
+
+    Handles:
+      - null
+      - string
+      - dict with email/id
+      - list of strings or dicts
+    """
     assigned_to = ticket.get("assignedTo")
     logger.debug("Raw assignedTo field: %r", assigned_to)
 
@@ -248,44 +245,43 @@ def extract_assigned_to(ticket: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def resolve_routing_key_for_group(group: str) -> str:
-    rk = SERVICE_GROUP_TO_ROUTING_KEY.get(group)
-    if not rk:
-        raise HTTPException(status_code=500, detail=f"No routing key configured for group {group}")
-    return rk
+def require_pd_routing_key():
+    if not PD_ROUTING_KEY:
+        logger.error("Missing PD_ROUTING_KEY env var")
+        raise HTTPException(status_code=500, detail="Missing PD routing key configuration")
 
 
 async def trigger_pd_for_ticket(
-    routing_key: str,
     ticket: Dict[str, Any],
-    assignee_identifier: str,
+    assignee_label: str,
     event_type: str,
 ) -> dict:
-    if not routing_key:
-        logger.error("Missing PagerDuty routing key when trying to trigger PD")
-        raise HTTPException(status_code=500, detail="Missing PagerDuty routing key")
+    """
+    Build and send PagerDuty event for a given ticket.
+    """
+    require_pd_routing_key()
 
     ticket_id = ticket.get("id") or ticket.get("ticketId") or "unknown"
     title = ticket.get("title") or f"Thena ticket {ticket_id}"
     priority = ticket.get("priorityName") or ticket.get("priority")
     severity = map_severity(priority)
 
-    # PagerDuty dedup for the same ticket => same incident
+    # PD dedup for the same ticket => same incident
     dedup_key = f"thena-ticket-{ticket_id}"
 
     pd_event = {
-        "routing_key": routing_key,
+        "routing_key": PD_ROUTING_KEY,
         "event_action": "trigger",
         "dedup_key": dedup_key,
         "payload": {
-            "summary": f"[{assignee_identifier}] {title}",
+            "summary": f"[{assignee_label}] {title}",
             "source": "thena",
             "severity": severity,
             "custom_details": {
                 "eventType": event_type,
                 "ticketId": ticket_id,
                 "priority": priority,
-                "assignee": assignee_identifier,
+                "assignee": assignee_label,
                 "team": ticket.get("teamName"),
                 "customer_email": ticket.get("customerContactEmail"),
             },
@@ -294,11 +290,11 @@ async def trigger_pd_for_ticket(
     }
 
     logger.info(
-        "Triggering PagerDuty for ticket_id=%s assignee=%s eventType=%s severity=%s",
+        "Triggering PagerDuty for ticket_id=%s eventType=%s severity=%s assigneeLabel=%s",
         ticket_id,
-        assignee_identifier,
         event_type,
         severity,
+        assignee_label,
     )
     logger.debug("PagerDuty payload: %s", pd_event)
 
@@ -314,11 +310,7 @@ async def trigger_pd_for_ticket(
         )
         raise HTTPException(status_code=500, detail="Failed to send event to PagerDuty")
 
-    logger.info(
-        "PagerDuty event accepted (202) for ticket_id=%s assignee=%s",
-        ticket_id,
-        assignee_identifier,
-    )
+    logger.info("PagerDuty event accepted (202) for ticket_id=%s", ticket_id)
     logger.debug("PagerDuty response body: %s", resp.text)
 
     return resp.json()
@@ -343,14 +335,17 @@ def thena_events_probe(req: Request):
 @app.post("/thena/events")
 async def thena_events(req: Request):
     """
-    New behavior:
+    Single-service behavior:
 
     - Only handle ticket:created and ticket:assigned
     - Trigger exactly once per ticket (atomic claim + persisted state)
-    - If ticket:created has NO assignee => trigger to DEFAULT_SERVICE_GROUP (triage)
-    - If ticket:created has assignee => route by assignee mapping
-    - If ticket:assigned happens later => triggers only if ticket hasn't already been handled
-      (re-assignments will not trigger due to state)
+    - ticket:created:
+        * assigned => trigger once
+        * unassigned => trigger once with assigneeLabel=UNASSIGNED
+    - ticket:assigned:
+        * triggers only if ticket not handled already
+        * optional allowlist check controlled by REQUIRE_ASSIGNEE_IN_TEAM
+    - Ignore ticket:updated and all other event types
     """
     require_token(req)
     body = await safe_json(req)
@@ -377,7 +372,6 @@ async def thena_events(req: Request):
     )
     logger.debug("Full Thena payload: %s", body)
 
-    # Only act on ticket:created / ticket:assigned
     if event_type not in ("ticket:created", "ticket:assigned"):
         logger.info(
             "Ignoring eventType=%s for ticketId=%s (not ticket:created/assigned)",
@@ -386,7 +380,7 @@ async def thena_events(req: Request):
         )
         return {"ok": True, "ignored": True, "eventType": event_type}
 
-    # If already triggered/processing -> ignore
+    # If already handled/processing -> ignore
     if is_ticket_handled(ticket_id):
         logger.info(
             "ticketId=%s already handled (triggered/processing) -> ignoring eventType=%s",
@@ -410,45 +404,9 @@ async def thena_events(req: Request):
         assignee_identifier,
     )
 
-    # Decide routing
-    chosen_group: Optional[str] = None
-    effective_assignee_label: str = ""
-
-    if assignee_identifier:
-        # Route by assignee mapping
-        chosen_group = ASSIGNEE_TO_SERVICE_GROUP.get(assignee_identifier)
-        if not chosen_group:
-            logger.info(
-                "ticketId=%s assignee=%s has no PD mapping -> ignoring",
-                ticket_id,
-                assignee_identifier,
-            )
-            return {
-                "ok": True,
-                "ignored": True,
-                "reason": "no_mapping_for_assignee",
-                "assignee": assignee_identifier,
-                "ticketId": ticket_id,
-                "eventType": event_type,
-            }
-        effective_assignee_label = assignee_identifier
-    else:
-        # No assignee:
-        # - On creation => send to default triage group
-        # - On assigned event with missing assignee => ignore (should not happen, but safe)
-        if event_type == "ticket:created":
-            chosen_group = DEFAULT_SERVICE_GROUP
-            effective_assignee_label = "UNASSIGNED"
-            logger.info(
-                "ticketId=%s created with NO assignee -> routing to DEFAULT_SERVICE_GROUP=%s",
-                ticket_id,
-                chosen_group,
-            )
-        else:
-            logger.info(
-                "ticketId=%s assigned event but no assignee present -> ignoring",
-                ticket_id,
-            )
+    # On assigned events, optionally ensure assignee belongs to our 4-member team.
+    if event_type == "ticket:assigned" and REQUIRE_ASSIGNEE_IN_TEAM:
+        if not assignee_identifier:
             return {
                 "ok": True,
                 "ignored": True,
@@ -456,9 +414,37 @@ async def thena_events(req: Request):
                 "ticketId": ticket_id,
                 "eventType": event_type,
             }
+        if assignee_identifier not in TEAM_MEMBERS:
+            logger.info(
+                "ticketId=%s assigned to %s which is not in TEAM_MEMBERS -> ignoring",
+                ticket_id,
+                assignee_identifier,
+            )
+            return {
+                "ok": True,
+                "ignored": True,
+                "reason": "assignee_not_in_team",
+                "assignee": assignee_identifier,
+                "ticketId": ticket_id,
+                "eventType": event_type,
+            }
 
-    # Resolve routing key
-    routing_key = resolve_routing_key_for_group(chosen_group)
+    # Determine label for PD summary
+    if assignee_identifier:
+        assignee_label = assignee_identifier
+    else:
+        # Unassigned ticket on creation => triage to same single service
+        if event_type == "ticket:created":
+            assignee_label = "UNASSIGNED"
+        else:
+            # assigned event without assignee present
+            return {
+                "ok": True,
+                "ignored": True,
+                "reason": "no_assignee_on_assigned",
+                "ticketId": ticket_id,
+                "eventType": event_type,
+            }
 
     # Atomic claim BEFORE triggering PD
     claimed = claim_ticket(ticket_id)
@@ -476,18 +462,16 @@ async def thena_events(req: Request):
         }
 
     logger.info(
-        "ticketId=%s eventType=%s routing to group=%s assigneeLabel=%s -> triggering PD",
+        "ticketId=%s eventType=%s assigneeLabel=%s -> triggering PD (single service)",
         ticket_id,
         event_type,
-        chosen_group,
-        effective_assignee_label,
+        assignee_label,
     )
 
     try:
         pd_response = await trigger_pd_for_ticket(
-            routing_key=routing_key,
             ticket=ticket,
-            assignee_identifier=effective_assignee_label,
+            assignee_label=assignee_label,
             event_type=event_type,
         )
         mark_triggered(ticket_id)
@@ -498,12 +482,10 @@ async def thena_events(req: Request):
             "pagerduty": pd_response,
             "ticketId": ticket_id,
             "assignee": assignee_identifier,
-            "assigneeLabel": effective_assignee_label,
-            "serviceGroup": chosen_group,
+            "assigneeLabel": assignee_label,
             "eventType": event_type,
         }
     except Exception as e:
-        # release claim so it can retry later
         release_claim(ticket_id)
         logger.exception("ticketId=%s trigger failed; released claim. Error=%s", ticket_id, e)
         raise
